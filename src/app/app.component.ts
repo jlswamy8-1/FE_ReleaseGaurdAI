@@ -1,6 +1,8 @@
 import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
+import { finalize } from 'rxjs';
 
 export type GateStatus = 'PASS' | 'RISK' | 'FAIL' | 'READY';
 
@@ -18,8 +20,11 @@ interface ReleaseScenario {
   id: string;
   name: string;
   date: string;
+  previousReleaseId: string;
   score: number;
   decision: string;
+  summary: string;
+  risks: string[];
   gates: Gate[];
   blockers: string[];
   changes: string[];
@@ -38,24 +43,27 @@ interface ApiRelease {
   id: string;
   name: string;
   releaseDate: string;
+  previousReleaseId?: string;
   gates: ApiGate[];
   changes?: string[];
   score?: number;
   decision?: string;
   blockers?: string[];
+  releaseSummary?: string;
+  risks?: string[];
 }
 
-interface ApiDecision {
-  decision?: string;
-  status?: string;
-  score?: number;
-  blockers?: string[];
+interface ApiReleaseResponse extends ApiRelease {
+  releaseId?: string;
+  release?: ApiRelease;
+  data?: ApiRelease;
+  result?: ApiRelease;
 }
 
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [CommonModule],
+  imports: [CommonModule, FormsModule],
   templateUrl: './app.component.html',
   styleUrl: './app.component.scss',
   changeDetection: ChangeDetectionStrategy.OnPush
@@ -77,8 +85,11 @@ export class AppComponent {
     id: 'unavailable',
     name: 'Release unavailable',
     date: '',
+    previousReleaseId: '',
     score: 0,
     decision: 'AT RISK',
+    summary: '',
+    risks: [],
     gates: [],
     blockers: [],
     changes: []
@@ -93,10 +104,12 @@ export class AppComponent {
     this.http.get<ApiRelease[] | { releases: ApiRelease[] }>(`${this.baseUrl}/api/releases`).subscribe({
       next: (response) => {
         const releases = Array.isArray(response) ? response : response.releases;
-        this.scenarios.set(releases.map((release) => this.toScenario(release)));
-        if (releases.length > 0) {
-          this.selectedId.set(releases[0].id);
-          this.loadRelease(releases[0].id);
+        const scenarios = releases.map((release) => this.toScenario(release));
+        this.scenarios.set(scenarios);
+        if (scenarios.length > 0) {
+          const defaultReleaseId = scenarios[0].id;
+          this.selectedId.set(defaultReleaseId);
+          this.loadRelease(defaultReleaseId);
         }
         this.isLoading.set(false);
       },
@@ -114,17 +127,21 @@ export class AppComponent {
     });
   }
 
-  private toScenario(release: ApiRelease, decision?: ApiDecision): ReleaseScenario {
-    const blockers = decision?.blockers ?? release.blockers ?? release.gates.flatMap((gate) => gate.blockers ?? []);
-    const score = decision?.score ?? release.score ?? release.gates.reduce((total, gate) => total + gate.score, 0);
-    const decisionText = decision?.decision ?? decision?.status ?? release.decision ?? (blockers.length ? 'AT RISK' : 'READY');
+  private toScenario(release: ApiRelease): ReleaseScenario {
+    const gates = release.gates ?? [];
+    const blockers = release.blockers ?? gates.flatMap((gate) => gate.blockers ?? []);
+    const score = release.score ?? gates.reduce((total, gate) => total + gate.score, 0);
+    const decisionText = release.decision ?? (blockers.length ? 'AT RISK' : 'READY');
     return {
-      id: release.id,
+      id: String(release.id),
       name: release.name,
       date: release.releaseDate,
+      previousReleaseId: release.previousReleaseId ?? '',
       score,
       decision: decisionText.toUpperCase(),
-      gates: release.gates.map((gate) => ({
+      summary: release.releaseSummary ?? '',
+      risks: release.risks ?? [],
+      gates: gates.map((gate) => ({
         name: gate.type.replaceAll('_', ' '),
         system: gate.type,
         icon: gate.type.charAt(0),
@@ -143,32 +160,70 @@ export class AppComponent {
     return normalized === 'PASS' || normalized === 'READY' || normalized === 'RISK' || normalized === 'FAIL' ? normalized : 'RISK';
   }
 
-  selectRelease(event: Event): void {
-    const select = event.target as HTMLSelectElement;
-    this.selectedId.set(select.value);
+  selectRelease(releaseId: string): void {
+    this.selectedId.set(releaseId);
     this.showChanges.set(false);
-    this.loadRelease(select.value);
+    this.loadRelease(releaseId);
   }
 
-  analyze(): void {
+  openSummary(): void {
+    if (this.selected().summary) {
+      this.showSummary.set(true);
+      return;
+    }
+
+    this.analyze(true);
+  }
+
+  analyze(openSummary = false): void {
+    const releaseId = this.selectedId();
+    if (!releaseId) {
+      return;
+    }
+
     this.isAnalyzing.set(true);
-    this.http.post<ApiRelease>(`${this.baseUrl}/api/releases/${this.selectedId()}/analyze`, {}).subscribe({
-      next: (release) => {
-        this.http.get<ApiDecision>(`${this.baseUrl}/api/releases/${this.selectedId()}/decision`).subscribe({
-          next: (decision) => this.updateScenario(this.toScenario(release, decision)),
-          error: () => this.updateScenario(this.toScenario(release))
-        });
+    this.http.post<ApiReleaseResponse>(`${this.baseUrl}/api/releases/${releaseId}/analyze`, {}).pipe(
+      finalize(() => this.isAnalyzing.set(false))
+    ).subscribe({
+      next: (response) => {
+        const currentScenario = this.selected();
+        const analyzedRelease = this.unwrapRelease(response, currentScenario);
+        this.updateScenario(this.toScenario(analyzedRelease));
+        if (openSummary) {
+          this.showSummary.set(true);
+        }
       },
-      error: () => {
-        this.errorMessage.set('Release analysis failed.');
-        this.isAnalyzing.set(false);
-      }
+      error: () => this.errorMessage.set('Release analysis failed.')
     });
+  }
+
+  private unwrapRelease(response: ApiReleaseResponse, currentScenario: ReleaseScenario): ApiRelease {
+    const release = response.release ?? response.data ?? response.result ?? response;
+    return {
+      ...release,
+      id: release.id ?? response.releaseId ?? currentScenario.id,
+      name: release.name ?? currentScenario.name,
+      releaseDate: release.releaseDate ?? currentScenario.date,
+      previousReleaseId: release.previousReleaseId ?? currentScenario.previousReleaseId,
+      gates: release.gates?.length ? release.gates : currentScenario.gates.map((gate) => ({
+        type: gate.system,
+        status: gate.status,
+        score: gate.score,
+        headline: gate.detail,
+        findings: gate.metric === 'No findings' ? [] : [gate.metric],
+        blockers: []
+      })),
+      changes: release.changes ?? currentScenario.changes,
+      score: release.score ?? currentScenario.score,
+      decision: release.decision ?? currentScenario.decision,
+      blockers: release.blockers ?? currentScenario.blockers,
+      releaseSummary: release.releaseSummary ?? response.releaseSummary ?? currentScenario.summary,
+      risks: release.risks ?? response.risks ?? currentScenario.risks
+    };
   }
 
   private updateScenario(scenario: ReleaseScenario): void {
     this.scenarios.update((scenarios) => scenarios.map((item) => item.id === scenario.id ? scenario : item));
-    this.isAnalyzing.set(false);
   }
 
   toggleRollback(): void {
